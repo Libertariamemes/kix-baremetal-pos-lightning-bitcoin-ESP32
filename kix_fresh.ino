@@ -5,14 +5,15 @@
 #include "TFT_KIX/TFT_eSPI.h"
 
 /* --- EMBEDDED KEYPAD LOGIC --- */
+// Defines the physical grid and maps pins to the 4x4 matrix
 const byte ROWS = 4;
 const byte COLS = 4;
 char keys[ROWS][COLS] = {
   {'1','2','3','A'}, {'4','5','6','B'},
   {'7','8','9','C'}, {'*','0','#','D'}
 };
-byte rowPins[ROWS] = {33, 25, 26, 27}; 
-byte colPins[COLS] = {15, 13, 12, 2}; 
+byte rowPins[ROWS] = {33, 25, 26, 27};
+byte colPins[COLS] = {15, 13, 12, 2};
 
 /* --- CONFIGURATION --- */
 const char* ssid = "TP-Link_46C2";
@@ -21,18 +22,20 @@ String lnbits_url = "http://34.226.196.147:5004/api/v1/payments";
 String lnbits_api_key = "2b273ca3d3a84db4a3857ff54776aa96";
 
 /* --- GLOBAL STATE --- */
-String current_payment_hash = "";
-String input_amount = "";
+String current_payment_hash = ""; // Stores hash to verify payment status later
+String input_amount = "";        // Buffer for keypad digit entry
 TFT_eSPI tft = TFT_eSPI();
-unsigned long lastKeyTime = 0;
+unsigned long lastKeyTime = 0;   // Debounce timer for mechanical keys
 
+// Hardware-specific wake-up for display/backlight pins
 void kickstartHardware() {
-  pinMode(4, OUTPUT); digitalWrite(4, HIGH); 
-  pinMode(23, OUTPUT); digitalWrite(23, HIGH); 
+  pinMode(4, OUTPUT); digitalWrite(4, HIGH);
+  pinMode(23, OUTPUT); digitalWrite(23, HIGH);
 }
 
+// Visual logger for the bottom of the screen
 void logDisplay(String msg, uint16_t color = 0xFFFF) {
-  tft.fillRect(0, 110, 240, 25, 0x0000); 
+  tft.fillRect(0, 110, 240, 25, 0x0000);
   tft.setCursor(0, 115);
   tft.setTextColor(color, 0x0000);
   tft.setTextSize(2);
@@ -40,16 +43,18 @@ void logDisplay(String msg, uint16_t color = 0xFFFF) {
   Serial.println("[LOG] " + msg);
 }
 
+// Renders the current digit buffer (SATS amount) to the main screen area
 void displayInput() {
   tft.fillRect(0, 40, 240, 60, 0x0000);
   tft.setCursor(10, 50);
-  tft.setTextColor(0xF81F, 0x0000); // Pink/Magenta for SATS
-  tft.setTextSize(5); 
+  tft.setTextColor(0xF81F, 0x0000); // KIX Signature Pink/Magenta
+  tft.setTextSize(5);
   tft.print(input_amount);
   tft.setTextSize(2);
   tft.print(" SATS");
 }
 
+// Manual scanning of the keypad matrix (avoids extra library overhead)
 char getCustomKey() {
   if (millis() - lastKeyTime < 250) return 0;
   for (int r = 0; r < ROWS; r++) {
@@ -65,23 +70,25 @@ char getCustomKey() {
   return 0;
 }
 
+// Initializes connection and shows the KIX splash screen
 void connectWiFi() {
-  input_amount = ""; 
+  input_amount = "";
   tft.fillScreen(0x0000);
-  tft.setTextColor(0xF81F, 0x0000); // Pink Title
+  tft.setTextColor(0xF81F, 0x0000); 
   tft.setTextSize(3);
   tft.setCursor(0, 10);
   tft.println("PROJECT KIX");
-  
+
   if(WiFi.status() != WL_CONNECTED) {
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) { delay(500); kickstartHardware(); }
   }
-  
-  logDisplay("ONLINE", 0x07E0); 
+
+  logDisplay("ONLINE", 0x07E0); // Green status
   displayInput();
 }
 
+// Fetches wallet data from the LNbits API (Key A)
 void checkBalance() {
   logDisplay("FETCHING...", 0xFFE0);
   HTTPClient http;
@@ -94,7 +101,7 @@ void checkBalance() {
     DynamicJsonDocument doc(1024);
     deserializeJson(doc, raw);
     long balance = doc["balance_msat"].as<long>() / 1000;
-    
+
     tft.fillScreen(0x0000);
     tft.setCursor(0, 10); tft.setTextColor(0xF81F); tft.setTextSize(2);
     tft.println("WALLET BALANCE:");
@@ -109,6 +116,7 @@ void checkBalance() {
   http.end();
 }
 
+// POST request to create a BOLT11 invoice (Key #)
 void createInvoice(int sats) {
   logDisplay("ORDERING...", 0x07FF);
   HTTPClient http;
@@ -116,11 +124,10 @@ void createInvoice(int sats) {
   http.addHeader("X-Api-Key", lnbits_api_key);
   http.addHeader("Content-Type", "application/json");
   String payload = "{\"out\": false, \"amount\":" + String(sats) + ", \"memo\": \"KIX-POS\"}";
-  
+
   int httpCode = http.POST(payload);
   String response = http.getString();
-  
-  // RAW Spill to Serial as requested
+
   Serial.println("[RAW_INVOICE_RESPONSE]: " + response);
 
   if (httpCode == 200 || httpCode == 201) {
@@ -128,17 +135,16 @@ void createInvoice(int sats) {
     deserializeJson(doc, response);
     String bolt11 = doc["payment_request"].as<String>();
     current_payment_hash = doc["payment_hash"].as<String>();
-    
+
     tft.fillScreen(0x0000);
     tft.setCursor(0, 0); tft.setTextColor(0x07FF); tft.setTextSize(1);
     tft.println("INVOICE (BOLT11):");
     tft.setTextColor(0xFFFF);
-    tft.println(bolt11); // Show raw bolt11 on display
-    
+    tft.println(bolt11); // Raw string display - fallback if QR is not used
+
     tft.setCursor(0, 110); tft.setTextColor(0xF81F); tft.setTextSize(2);
     tft.println("Press 'C' to Verify");
   } else {
-    // Spill error to display for debugging
     tft.fillScreen(0x0000);
     tft.setCursor(0, 0); tft.setTextColor(0xF800); tft.setTextSize(1);
     tft.println("HTTP ERROR: " + String(httpCode));
@@ -150,6 +156,7 @@ void createInvoice(int sats) {
   kickstartHardware();
 }
 
+// Verifies if the payment hash has been settled (Key C)
 void manualCheck() {
   if (current_payment_hash == "") { logDisplay("NO INVOICE", 0xF800); return; }
   logDisplay("CHECKING...", 0xFFFF);
@@ -166,8 +173,8 @@ void manualCheck() {
       tft.fillScreen(0x07E0); tft.setTextColor(0x0000);
       tft.setCursor(20, 50); tft.setTextSize(4);
       tft.println("PAID OK!"); delay(5000); connectWiFi();
-    } else { 
-      logDisplay("NOT PAID YET", 0xF800); 
+    } else {
+      logDisplay("NOT PAID YET", 0xF800);
     }
   } else {
     logDisplay("CHECK_ERR: " + String(code), 0xF800);
@@ -188,11 +195,12 @@ void loop() {
     if (key >= '0' && key <= '9') { input_amount += key; displayInput(); }
     else if (key == 'A') checkBalance();
     else if (key == 'C') manualCheck();
-    else if (key == 'D') connectWiFi(); // Reset/Clear to Home
-    else if (key == '*') { input_amount = ""; displayInput(); }
-    else if (key == '#') { createInvoice(input_amount.toInt()); input_amount = ""; }
+    else if (key == 'D') connectWiFi(); // Reset to Home
+    else if (key == '*') { input_amount = ""; displayInput(); } // Clear buffer
+    else if (key == '#') { createInvoice(input_amount.toInt()); input_amount = ""; } // Confirm & Pay
   }
-  
+
+  // Support for Serial commands (headless control via PC)
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n'); input.trim();
     if (input.startsWith("I:")) { createInvoice(input.substring(2).toInt()); }
