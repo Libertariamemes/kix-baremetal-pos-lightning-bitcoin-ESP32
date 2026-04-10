@@ -1,0 +1,182 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include "TFT_KIX/TFT_eSPI.h"
+
+/* --- CONFIGURATION --- */
+const char* ssid = "TP-Link_46C2";
+const char* password = "80165897";
+const char* coinapi_key = "3e97fe7f-44be-4fec-939c-e59a9342703b";
+String lnbits_url = "http://34.226.196.147:5004/api/v1/payments";
+String lnbits_api_key = "2b273ca3d3a84db4a3857ff54776aa96";
+
+/* --- GLOBAL STATE --- */
+String current_payment_hash = "";
+bool waiting_for_payment = false; 
+TFT_eSPI tft = TFT_eSPI();
+
+void kickstartHardware() {
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH); 
+  pinMode(23, OUTPUT);
+  digitalWrite(23, HIGH); 
+}
+
+void logDisplay(String msg, uint16_t color = 0xFFFF) {
+  tft.fillRect(0, 110, 240, 25, 0x0000);
+  tft.setCursor(0, 115);
+  tft.setTextColor(color, 0x0000);
+  tft.setTextSize(1);
+  tft.println("> " + msg);
+  Serial.println("[LOG] " + msg);
+}
+
+void connectWiFi() {
+  tft.fillScreen(0x0000);
+  tft.setTextColor(0x07E0, 0x0000);
+  tft.setTextSize(2);
+  tft.setCursor(0, 0);
+  tft.println("PROJECT KIX");
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    kickstartHardware();
+  }
+  logDisplay("WIFI ONLINE", 0x07E0);
+}
+
+void checkBalance() {
+  logDisplay("SPILLING WALLET RAW...", 0xFFE0);
+  HTTPClient http;
+  http.begin("http://34.226.196.147:5004/api/v1/wallet");
+  http.addHeader("X-Api-Key", lnbits_api_key);
+
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String raw = http.getString();
+    Serial.println("\n--- RAW WALLET ---\n" + raw + "\n------------------");
+    
+    tft.fillScreen(0x0000);
+    tft.setCursor(0, 10);
+    tft.setTextColor(0xFFE0); tft.setTextSize(1);
+    tft.println("RAW WALLET:");
+    tft.setCursor(0, 30);
+    tft.setTextColor(0xFFFF);
+    tft.println(raw.substring(0, 240)); // Show as much as fits
+    
+    delay(8000);
+    connectWiFi();
+  } else {
+    logDisplay("BAL ERR: " + String(httpCode), 0xF800);
+  }
+  http.end();
+  kickstartHardware();
+}
+
+void checkBTCPrice() {
+  logDisplay("SPILLING BTC RAW...", 0xFBE0);
+  HTTPClient http;
+  http.begin("https://rest.coinapi.io/v1/exchangerate/BTC/USD");
+  http.addHeader("X-CoinAPI-Key", coinapi_key);
+  http.setTimeout(7000);
+
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String raw = http.getString();
+    Serial.println("\n--- RAW BTC PRICE ---\n" + raw + "\n---------------------");
+    
+    // Try to parse just for the Serial debug, but spill the raw text to screen
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, raw);
+    double price = doc["rate"].as<double>();
+    Serial.printf("Parsed Price: $%.2f\n", price);
+
+    tft.fillScreen(0x0000);
+    tft.setCursor(0, 10);
+    tft.setTextColor(0xFBE0); tft.setTextSize(1);
+    tft.println("RAW BTC DATA:");
+    tft.setCursor(0, 30);
+    tft.setTextColor(0xFFFF);
+    tft.println(raw.substring(0, 240));
+    
+    delay(8000);
+    connectWiFi();
+  } else {
+    logDisplay("BTC ERR: " + String(httpCode), 0xF800);
+    // If it's 403, your API key is likely expired or wrong.
+  }
+  http.end();
+  kickstartHardware();
+}
+
+// ... (keep createInvoice, manualCheck, setup as they were) ...
+
+void createInvoice(int sats) {
+  logDisplay("ORDERING " + String(sats) + " SATS...", 0x07FF);
+  HTTPClient http;
+  http.begin(lnbits_url);
+  http.addHeader("X-Api-Key", lnbits_api_key);
+  http.addHeader("Content-Type", "application/json");
+  String payload = "{\"out\": false, \"amount\":" + String(sats) + ", \"memo\": \"KIX-MANUAL\"}";
+  int httpCode = http.POST(payload);
+  if (httpCode > 0) {
+    DynamicJsonDocument doc(4096);
+    deserializeJson(doc, http.getStream());
+    if (doc.containsKey("payment_request")) {
+      current_payment_hash = doc["payment_hash"].as<String>();
+      waiting_for_payment = true;
+      Serial.println("\n--- BOLT11 ---\n" + doc["payment_request"].as<String>() + "\n--------------");
+      logDisplay("SEND 'C:' TO CHECK", 0xF81F);
+    }
+  }
+  http.end();
+  kickstartHardware();
+}
+
+void manualCheck() {
+  if (current_payment_hash == "") { logDisplay("NO ACTIVE HASH", 0xF800); return; }
+  logDisplay("CHECKING HASH...", 0xFFFF);
+  String url = lnbits_url + "/" + current_payment_hash;
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("X-Api-Key", lnbits_api_key);
+  if (http.GET() == 200) {
+    DynamicJsonDocument doc(2048);
+    deserializeJson(doc, http.getStream());
+    if (doc["paid"].as<bool>()) {
+      Serial.println("[SUCCESS] PAID!");
+      waiting_for_payment = false;
+      http.end(); kickstartHardware(); delay(100);
+      tft.fillScreen(0x0000); tft.setTextColor(0x07E0); tft.setCursor(10, 55); tft.setTextSize(3);
+      tft.println("PAYMENT OK!");
+      Serial.println("[LOG] Pipe stabilized.");
+      delay(5000); connectWiFi(); return;
+    } else { logDisplay("NOT PAID YET", 0xFFE0); }
+  }
+  http.end(); kickstartHardware();
+}
+
+void setup() {
+  Serial.begin(115200);
+  kickstartHardware();
+  tft.init(); tft.setRotation(1); tft.fillScreen(0x0000);
+  connectWiFi();
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.startsWith("I:")) {
+      int amount = input.substring(2).toInt();
+      if (amount > 0) createInvoice(amount);
+    }
+    else if (input.equalsIgnoreCase("C:")) manualCheck();
+    else if (input.equalsIgnoreCase("L:")) checkBalance();
+    else if (input.equalsIgnoreCase("B:")) checkBTCPrice();
+    else if (input.equalsIgnoreCase("R:")) ESP.restart();
+  }
+}
